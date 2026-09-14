@@ -50,6 +50,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream as S3ByteStream;
 use bytes::Bytes;
 use futures::StreamExt;
+use tokio::sync::Mutex;
 
 use crate::{
     BoxStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
@@ -64,6 +65,9 @@ pub struct S3Store {
     http: reqwest::Client,
     multipart_threshold: u64,
     multipart_part_size: u64,
+    /// OSS has no destination If-Match support. In OSS mode every mutation is
+    /// serialized, so HEAD + compare + PUT is safe for a single WalGit process.
+    mutation_lock: Option<Mutex<()>>,
 }
 
 impl S3Store {
@@ -74,6 +78,19 @@ impl S3Store {
     /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), plus
     /// `AWS_SESSION_TOKEN` when present.
     pub fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
+        Self::new_inner(cfg, false)
+    }
+
+    /// Build an Alibaba Cloud OSS store.
+    ///
+    /// OSS rejects S3 conditional PutObject headers. Mutations are therefore
+    /// serialized inside this process and CAS updates use HEAD + compare + PUT.
+    /// Only one WalGit process may write a bucket configured this way.
+    pub fn new_oss(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
+        Self::new_inner(cfg, true)
+    }
+
+    fn new_inner(cfg: &walgit_config::StoreConfig, oss_compat: bool) -> anyhow::Result<Self> {
         let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
             anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
         })?;
@@ -107,6 +124,7 @@ impl S3Store {
             http,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size: cfg.multipart_part_size.as_u64(),
+            mutation_lock: oss_compat.then(|| Mutex::new(())),
         })
     }
 
@@ -367,6 +385,35 @@ impl ObjectStore for S3Store {
     }
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
+        let _mutation_guard = match &self.mutation_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
+        // OSS PutObject rejects If-Match and If-None-Match. Holding the
+        // process-wide mutation lock makes this check-and-write sequence a CAS
+        // as long as this bucket has exactly one WalGit writer.
+        if self.mutation_lock.is_some() {
+            let current = self.head(key).await?;
+            match &opts.mode {
+                PutMode::Create if current.is_some() => {
+                    return Err(StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current: current.map(|meta| meta.version),
+                    });
+                }
+                PutMode::Update(want)
+                    if current.as_ref().map(|meta| &meta.version) != Some(want) =>
+                {
+                    return Err(StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current: current.map(|meta| meta.version),
+                    });
+                }
+                _ => {}
+            }
+        }
+
         let (s3_body, len) = body_to_s3(body).await?;
 
         // Multipart only for Overwrite (CreateMultipartUpload has no
@@ -387,13 +434,15 @@ impl ObjectStore for S3Store {
             .body(s3_body)
             .content_length(i64::try_from(len).map_err(StoreError::other)?);
 
-        match &opts.mode {
-            PutMode::Overwrite => {}
-            PutMode::Create => {
-                builder = builder.if_none_match("*");
-            }
-            PutMode::Update(v) => {
-                builder = builder.if_match(v.as_str());
+        if self.mutation_lock.is_none() {
+            match &opts.mode {
+                PutMode::Overwrite => {}
+                PutMode::Create => {
+                    builder = builder.if_none_match("*");
+                }
+                PutMode::Update(v) => {
+                    builder = builder.if_match(v.as_str());
+                }
             }
         }
 
@@ -425,6 +474,10 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+        let _mutation_guard = match &self.mutation_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         if let Some(want) = &if_version {
             // S3 has no conditional delete: emulate via HEAD + compare + DELETE.
             // RACE: a concurrent writer could replace the object between HEAD
@@ -616,6 +669,10 @@ impl ObjectStore for S3Store {
         sources: &[String],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
+        let _mutation_guard = match &self.mutation_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         const MIN_PART: u64 = 5 * 1024 * 1024;
         const COPY_PART: u64 = 1024 * 1024 * 1024; // <= 5 GiB per UploadPartCopy
         if sources.is_empty() {
@@ -623,13 +680,21 @@ impl ObjectStore for S3Store {
                 "compose needs at least one source".into(),
             ));
         }
-        if let PutMode::Create = opts.mode
-            && self.head(dest).await?.is_some()
-        {
-            return Err(StoreError::PreconditionFailed {
-                key: dest.to_owned(),
-                current: None,
-            });
+        let current = self.head(dest).await?;
+        match &opts.mode {
+            PutMode::Create if current.is_some() => {
+                return Err(StoreError::PreconditionFailed {
+                    key: dest.to_owned(),
+                    current: current.map(|meta| meta.version),
+                });
+            }
+            PutMode::Update(want) if current.as_ref().map(|meta| &meta.version) != Some(want) => {
+                return Err(StoreError::PreconditionFailed {
+                    key: dest.to_owned(),
+                    current: current.map(|meta| meta.version),
+                });
+            }
+            _ => {}
         }
         // Sizes first: the layout of parts depends on them.
         let mut sizes = Vec::with_capacity(sources.len());
