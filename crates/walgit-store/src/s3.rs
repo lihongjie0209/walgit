@@ -111,6 +111,18 @@ impl S3Store {
             .force_path_style(cfg.s3.force_path_style)
             .behavior_version_latest();
 
+        if oss_compat {
+            // OSS does not implement AWS's optional trailing checksum stream
+            // encoding, which the SDK otherwise enables for file bodies.
+            s3_config = s3_config
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                );
+        }
+
         if !cfg.s3.endpoint.is_empty() {
             s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
         }

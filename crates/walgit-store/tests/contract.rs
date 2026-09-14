@@ -757,9 +757,21 @@ async fn oss_contract() {
         ..Default::default()
     };
 
-    let store: DynStore = Arc::new(
-        walgit_store::s3::S3Store::new_oss(&cfg).expect("S3Store::new_oss"),
-    );
+    let store: DynStore =
+        Arc::new(walgit_store::s3::S3Store::new_oss(&cfg).expect("S3Store::new_oss"));
+
+    // File bodies exercise the AWS streaming encoder used for Git pack/index
+    // uploads. OSS rejects the SDK's optional trailing checksum encoding.
+    let file = tempfile::NamedTempFile::new().expect("temporary file");
+    std::fs::write(file.path(), b"file-body").expect("write temporary file");
+    store
+        .put(
+            &format!("{prefix}/file-body"),
+            PutBody::File(file.path().to_owned()),
+            PutMode::Create.into(),
+        )
+        .await
+        .expect("OSS file-body create");
     run_contract(store.clone(), &prefix).await;
 
     let to_delete: Vec<_> = futures::stream::iter(
