@@ -328,10 +328,12 @@ fn classify_put_error(
 ) -> StoreError {
     let code = err_code(err).unwrap_or("");
     match code {
-        "PreconditionFailed" | "ConditionalRequestConflict" => StoreError::PreconditionFailed {
-            key: key.into(),
-            current: None,
-        },
+        "PreconditionFailed" | "ConditionalRequestConflict" | "FileAlreadyExists" => {
+            StoreError::PreconditionFailed {
+                key: key.into(),
+                current: None,
+            }
+        }
         _ => classify_error("s3 put error", err),
     }
 }
@@ -450,7 +452,21 @@ impl ObjectStore for S3Store {
             builder = builder.content_type(ct);
         }
 
-        let result = builder.send().await;
+        let result = if self.mutation_lock.is_some() && matches!(opts.mode, PutMode::Create) {
+            // OSS's atomic create primitive. Unlike S3 If-None-Match, this is
+            // understood by the native OSS API and returns FileAlreadyExists.
+            builder
+                .customize()
+                .mutate_request(|request| {
+                    request
+                        .headers_mut()
+                        .insert("x-oss-forbid-overwrite", "true");
+                })
+                .send()
+                .await
+        } else {
+            builder.send().await
+        };
         match result {
             Ok(resp) => {
                 let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
