@@ -64,7 +64,9 @@ anonymous_read = true             # must be false in oidc mode
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
 
 [store]
-backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
+backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "oss" | "memory" (tests)
+# OSS uses [store.s3]; requires one process/store instance for ALL bucket writes, no rolling overlap,
+# and offline CLI writes. See docs/OSS.md before selecting backend = "oss".
 bucket = "walgit"
 prefix = ""                       # global key prefix inside the bucket
 max_retries = 8                   # retries on retryable store errors (jittered backoff)

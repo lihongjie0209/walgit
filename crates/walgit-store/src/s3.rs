@@ -65,8 +65,8 @@ pub struct S3Store {
     http: reqwest::Client,
     multipart_threshold: u64,
     multipart_part_size: u64,
-    /// OSS has no destination If-Match support. In OSS mode every mutation is
-    /// serialized, so HEAD + compare + PUT is safe for a single WalGit process.
+    /// Serializes OSS Update and conditional delete check-and-write sequences.
+    /// All bucket writers must share this store instance; see docs/OSS.md.
     mutation_lock: Option<Mutex<()>>,
 }
 
@@ -83,10 +83,15 @@ impl S3Store {
 
     /// Build an Alibaba Cloud OSS store.
     ///
-    /// OSS rejects S3 conditional PutObject headers. Mutations are therefore
-    /// serialized inside this process and CAS updates use HEAD + compare + PUT.
-    /// Only one WalGit process may write a bucket configured this way.
+    /// OSS rejects S3 conditional `PutObject` headers. Updates compare the HEAD
+    /// result and PUT under a lock shared by this instance. Creates use OSS atomic
+    /// create. Only one store instance may write a bucket; see docs/OSS.md.
     pub fn new_oss(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
+        tracing::warn!(
+            "OSS requires one store instance owning all bucket writes: stop the old process \
+             completely before starting another; run direct bucket-writing CLI commands \
+             only while the server is stopped (docs/OSS.md)"
+        );
         Self::new_inner(cfg, true)
     }
 
@@ -334,10 +339,10 @@ where
     }
 }
 
-fn classify_put_error(
-    key: &str,
-    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
-) -> StoreError {
+fn classify_put_error<E>(key: &str, err: &aws_sdk_s3::error::SdkError<E>) -> StoreError
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
     let code = err_code(err).unwrap_or("");
     match code {
         "PreconditionFailed" | "ConditionalRequestConflict" | "FileAlreadyExists" => {
@@ -399,32 +404,22 @@ impl ObjectStore for S3Store {
     }
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
-        let _mutation_guard = match &self.mutation_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+        let _mutation_guard = match (&self.mutation_lock, &opts.mode) {
+            (Some(lock), PutMode::Update(_)) => Some(lock.lock().await),
+            _ => None,
         };
 
-        // OSS PutObject rejects If-Match and If-None-Match. Holding the
-        // process-wide mutation lock makes this check-and-write sequence a CAS
-        // as long as this bucket has exactly one WalGit writer.
-        if self.mutation_lock.is_some() {
+        // Only Update needs an emulated CAS. Immutable Creates use OSS's atomic
+        // forbid-overwrite header, and bulk Overwrites must not delay heartbeats.
+        if self.mutation_lock.is_some()
+            && let PutMode::Update(want) = &opts.mode
+        {
             let current = self.head(key).await?;
-            match &opts.mode {
-                PutMode::Create if current.is_some() => {
-                    return Err(StoreError::PreconditionFailed {
-                        key: key.into(),
-                        current: current.map(|meta| meta.version),
-                    });
-                }
-                PutMode::Update(want)
-                    if current.as_ref().map(|meta| &meta.version) != Some(want) =>
-                {
-                    return Err(StoreError::PreconditionFailed {
-                        key: key.into(),
-                        current: current.map(|meta| meta.version),
-                    });
-                }
-                _ => {}
+            if current.as_ref().map(|meta| &meta.version) != Some(want) {
+                return Err(StoreError::PreconditionFailed {
+                    key: key.into(),
+                    current: current.map(|meta| meta.version),
+                });
             }
         }
 
@@ -502,14 +497,14 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
-        let _mutation_guard = match &self.mutation_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+        let _mutation_guard = match (&self.mutation_lock, &if_version) {
+            (Some(lock), Some(_)) => Some(lock.lock().await),
+            _ => None,
         };
         if let Some(want) = &if_version {
-            // S3 has no conditional delete: emulate via HEAD + compare + DELETE.
-            // RACE: a concurrent writer could replace the object between HEAD
-            // and DELETE. Acceptable for walgit's lease-guarded semantics.
+            // OSS serializes this check/delete with Updates on this instance.
+            // S3 retains the HEAD/DELETE race with concurrent writers; callers
+            // rely on walgit's lease-guarded semantics.
             let head = self.head(key).await?;
             match head {
                 None => return Err(StoreError::NotFound { key: key.into() }),
@@ -697,10 +692,6 @@ impl ObjectStore for S3Store {
         sources: &[String],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
-        let _mutation_guard = match &self.mutation_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
         const MIN_PART: u64 = 5 * 1024 * 1024;
         const COPY_PART: u64 = 1024 * 1024 * 1024; // <= 5 GiB per UploadPartCopy
         if sources.is_empty() {
@@ -708,21 +699,15 @@ impl ObjectStore for S3Store {
                 "compose needs at least one source".into(),
             ));
         }
-        let current = self.head(dest).await?;
-        match &opts.mode {
-            PutMode::Create if current.is_some() => {
-                return Err(StoreError::PreconditionFailed {
-                    key: dest.to_owned(),
-                    current: current.map(|meta| meta.version),
-                });
-            }
-            PutMode::Update(want) if current.as_ref().map(|meta| &meta.version) != Some(want) => {
-                return Err(StoreError::PreconditionFailed {
-                    key: dest.to_owned(),
-                    current: current.map(|meta| meta.version),
-                });
-            }
-            _ => {}
+        // Retain S3's early Create check. OSS checks atomically at completion.
+        if self.mutation_lock.is_none()
+            && matches!(opts.mode, PutMode::Create)
+            && self.head(dest).await?.is_some()
+        {
+            return Err(StoreError::PreconditionFailed {
+                key: dest.to_owned(),
+                current: None,
+            });
         }
         // Sizes first: the layout of parts depends on them.
         let mut sizes = Vec::with_capacity(sources.len());
@@ -875,20 +860,54 @@ impl ObjectStore for S3Store {
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
-        let resp = match self
+        // Copy bulk parts without the control-plane lock. Only the final
+        // destination update belongs to the emulated CAS critical section.
+        let _mutation_guard = match (&self.mutation_lock, &opts.mode) {
+            (Some(lock), PutMode::Update(_)) => Some(lock.lock().await),
+            _ => None,
+        };
+        if let PutMode::Update(want) = &opts.mode {
+            let check = self.head(dest).await;
+            let error = match check {
+                Ok(current) if current.as_ref().map(|meta| &meta.version) != Some(want) => {
+                    Some(StoreError::PreconditionFailed {
+                        key: dest.into(),
+                        current: current.map(|meta| meta.version),
+                    })
+                }
+                Err(error) => Some(error),
+                Ok(_) => None,
+            };
+            if let Some(error) = error {
+                let _ = self.abort_multipart(dest, &upload_id).await;
+                return Err(error);
+            }
+        }
+        let complete = self
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(dest)
             .upload_id(&upload_id)
-            .multipart_upload(completed)
-            .send()
-            .await
-        {
+            .multipart_upload(completed);
+        let result = if self.mutation_lock.is_some() && matches!(opts.mode, PutMode::Create) {
+            complete
+                .customize()
+                .mutate_request(|request| {
+                    request
+                        .headers_mut()
+                        .insert("x-oss-forbid-overwrite", "true");
+                })
+                .send()
+                .await
+        } else {
+            complete.send().await
+        };
+        let resp = match result {
             Ok(r) => r,
             Err(e) => {
                 let _ = self.abort_multipart(dest, &upload_id).await;
-                return Err(classify_error("s3 complete multipart", &e));
+                return Err(classify_put_error(dest, &e));
             }
         };
         let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
@@ -1139,6 +1158,165 @@ mod tests {
             .behavior_version_latest()
             .build();
         S3Client::from_conf(conf)
+    }
+
+    fn oss_store(client: S3Client) -> S3Store {
+        S3Store {
+            client,
+            bucket: "b".into(),
+            http: reqwest::Client::new(),
+            multipart_threshold: u64::MAX,
+            multipart_part_size: 5 * 1024 * 1024,
+            mutation_lock: Some(Mutex::new(())),
+        }
+    }
+
+    #[tokio::test]
+    async fn oss_bulk_put_does_not_block_cas_and_cas_has_one_winner() {
+        use axum::{
+            body::Body,
+            http::{Method, Request},
+            response::Response,
+            routing::any,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::sync::Notify;
+
+        for mode in [PutMode::Create, PutMode::Overwrite] {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let version = Arc::new(AtomicUsize::new(0));
+            let app = axum::Router::new().fallback_service(any({
+                let entered = entered.clone();
+                let release = release.clone();
+                let version = version.clone();
+                let create = matches!(mode, PutMode::Create);
+                move |req: Request<Body>| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    let version = version.clone();
+                    async move {
+                        if req.uri().path() == "/b/pack" {
+                            assert_eq!(req.method(), Method::PUT, "bulk PUT must not HEAD");
+                            assert_eq!(
+                                req.headers().contains_key("x-oss-forbid-overwrite"),
+                                create
+                            );
+                            assert!(!req.headers().contains_key("if-none-match"));
+                            entered.notify_one();
+                            release.notified().await;
+                        } else {
+                            assert_eq!(req.uri().path(), "/b/manifest");
+                            if req.method() == Method::PUT {
+                                assert!(!req.headers().contains_key("if-match"));
+                                version.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                assert_eq!(req.method(), Method::HEAD);
+                            }
+                        }
+                        Response::builder()
+                            .header("etag", format!("\"v{}\"", version.load(Ordering::SeqCst)))
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let store = Arc::new(oss_store(client_for(&endpoint)));
+            let bulk = tokio::spawn({
+                let store = store.clone();
+                async move {
+                    store
+                        .put(
+                            "pack",
+                            PutBody::Bytes(Bytes::from_static(b"pack")),
+                            PutOptions::from(mode),
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            // The upload is still pending when both CAS attempts finish. The
+            // same initial version must succeed exactly once under the lock.
+            let update = || {
+                store.put(
+                    "manifest",
+                    PutBody::Bytes(Bytes::from_static(b"next")),
+                    PutOptions::from(PutMode::Update(Version::new("v0"))),
+                )
+            };
+            let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(update(), update())
+            })
+            .await
+            .expect("a bulk upload must not delay manifest CAS");
+            assert!(first.is_ok());
+            assert!(matches!(second, Err(StoreError::PreconditionFailed { .. })));
+            assert_eq!(version.load(Ordering::SeqCst), 1);
+            release.notify_one();
+            bulk.await.unwrap().unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn oss_compose_create_is_atomic_without_the_update_lock() {
+        use axum::{
+            body::Body,
+            http::{Method, Request},
+            response::Response,
+            routing::any,
+        };
+        let app = axum::Router::new().fallback_service(any(|req: Request<Body>| async move {
+            let body = match (req.method(), req.uri().path()) {
+                (&Method::HEAD, "/b/source") => {
+                    return Response::builder().header("content-length", "6291456")
+                        .header("etag", "\"source\"").body(Body::empty()).unwrap();
+                }
+                (&Method::POST, "/b/dest") if req.uri().query().unwrap().contains("uploads") => {
+                    "<InitiateMultipartUploadResult><UploadId>id</UploadId></InitiateMultipartUploadResult>"
+                }
+                (&Method::DELETE, "/b/dest") => {
+                    return Response::new(Body::empty());
+                }
+                (&Method::PUT, "/b/dest") => {
+                    "<CopyPartResult><ETag>part</ETag></CopyPartResult>"
+                }
+                (&Method::POST, "/b/dest") => {
+                    assert_eq!(req.headers()["x-oss-forbid-overwrite"], "true");
+                    // A competing create won while the parts were copied.
+                    return Response::builder().status(409)
+                        .body(Body::from("<Error><Code>FileAlreadyExists</Code></Error>"))
+                        .unwrap();
+                }
+                _ => panic!("unexpected compose request: {} {}", req.method(), req.uri()),
+            };
+            Response::new(Body::from(body))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = oss_store(client_for(&endpoint));
+        let _guard = store.mutation_lock.as_ref().unwrap().lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.compose(
+                "dest",
+                &["source".into()],
+                PutOptions::from(PutMode::Create),
+            ),
+        )
+        .await
+        .expect("compose Create must not acquire the update lock");
+        assert!(matches!(result, Err(StoreError::PreconditionFailed { .. })));
+        server.abort();
     }
 
     async fn put_error(client: &S3Client) -> SdkError<PutObjectError> {

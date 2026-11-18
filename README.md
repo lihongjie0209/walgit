@@ -117,6 +117,10 @@ with its reasoning, the invariants, and the cost model (round trips to the bucke
 
 ## Running it
 
+Alibaba Cloud OSS is available through `store.backend = "oss"` with
+`[store.s3]` endpoint and credentials. It requires exclusive bucket ownership
+by one process; read [OSS deployment restrictions](docs/OSS.md) before using it.
+
 ```sh
 # build (needs rust per rust-toolchain.toml, protoc, node 24 + pnpm for the web UI)
 just web-build && cargo build --release -p walgit-cli

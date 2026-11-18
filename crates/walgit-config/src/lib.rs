@@ -248,7 +248,8 @@ pub enum StoreBackend {
     Gcs,
     S3,
     /// Alibaba Cloud OSS through its S3-compatible endpoint. This mode
-    /// serializes mutations because OSS PutObject has no If-Match support.
+    /// emulates updates within one store instance; requires exclusive bucket
+    /// ownership, stop-before-start deployments and offline CLI writes (docs/OSS.md).
     Oss,
     /// Tests only.
     Memory,

@@ -27,6 +27,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/PACKFILE_URI_DESIGN.md` | Anyone implementing pack groups, proofs, lifecycle, or negotiated delivery. Design target; later layers require separate implementation and evidence. |
 | `docs/PACKFILE_MIGRATION.md` | Bundle removal, saved settings, writer cutover, clients and rollout gates. |
 | `docs/spec/README.md` | Bounded models, contract identifiers, result semantics, code/test map and remaining verification gaps. |
+| `docs/OSS.md` | OSS operators and embedded store callers: exclusive ownership, deployment and CLI restrictions. |
 | `docs/ROUNDTRIPS.md` | **Anyone touching a protocol that talks to the bucket** (publish, sync, checkpoints, compaction/leases, remote reader, store backends). Round trips are the cost model; correct is not sufficient. |
 | `docs/POLICY.md` | Anyone touching receive-pack authorization or writing a repo policy. Normative rule language. |
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
@@ -486,6 +487,16 @@ full cold-read/resource acceptance gates listed in `docs/spec/README.md`.
   current tip must appear in the resulting live inventory before the log claim/CAS. Raw producer admission
   and candidate external-boundary proof remain separate obligations; local loose objects and retired
   download membership cannot justify retirement. See the cost and remaining-evidence rows in the linked docs.
+
+- **D50 (2026-11-18): OSS is an explicit single-owner deployment exception.** `backend = "oss"`
+  uses OSS atomic Create and instance-locked HEAD/compare/PUT for Update. All bucket writes must
+  share one store instance in one process; this does not provide distributed CAS. Combine roles,
+  stop and await full process exit before replacement, and execute direct bucket-writing CLI
+  commands offline. Configuration cannot detect a second writer. Create/Overwrite bulk transfers
+  bypass the update lock; compose Update locks only its final check/completion. Callers must not
+  mix unconditional mutations with CAS on one mutable key. Bucket versioning must remain disabled.
+  [Operational restrictions](docs/OSS.md) define this exception; S3/GCS remain the shared-nothing
+  multi-writer choices. No bucket lease can make the emulated CAS a cross-process fence.
 
 ## 5. Working rules
 
